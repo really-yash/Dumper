@@ -24,20 +24,31 @@ jobs:
 
       - name: Dump Partitions
         run: |  
-          payload-dumper-go -o dumped_images -p vendor_boot,vendor_dlkm,dtbo payload.bin  
+          # Added 'boot' to the partition extraction list
+          payload-dumper-go -o dumped_images -p vendor_boot,vendor_dlkm,dtbo,boot payload.bin  
           rm -f payload.bin  
 
       - name: Extract Configs & Prebuilts
         run: |  
           mkdir -p extracted_assets/prebuilt extracted_assets/configs
           
-          # 1. Save dtbo.img and vendor_boot.img for the prebuilt folder
+          # 1. Save dtbo.img, vendor_boot.img, and raw boot.img for the prebuilt folder
           cp dumped_images/dtbo.img extracted_assets/prebuilt/ || true
           cp dumped_images/vendor_boot.img extracted_assets/prebuilt/ || true
+          cp dumped_images/boot.img extracted_assets/prebuilt/ || true
 
           cd dumped_images
           
-          # 2. Get the .rc files using magiskboot to avoid cpio crashes
+          # 2. Extract the standalone raw kernel binary from boot.img using magiskboot
+          if [ -f boot.img ]; then
+            magiskboot unpack boot.img || true
+            if [ -f kernel ]; then
+              cp kernel ../extracted_assets/prebuilt/kernel || true
+            fi
+            rm -f kernel ramdisk.cpio dtb base header || true
+          fi
+          
+          # 3. Get the .rc files from vendor_boot using magiskboot to avoid cpio crashes
           magiskboot unpack vendor_boot.img || true
           if [ -f ramdisk.cpio ]; then
             mkdir ramdisk_extracted && cd ramdisk_extracted
@@ -46,7 +57,7 @@ jobs:
             cd ..
           fi
 
-          # 3. Get the load order from vendor_dlkm (EROFS)
+          # 4. Get the load order from vendor_dlkm (EROFS)
           fsck.erofs --extract=vendor_dlkm_extracted vendor_dlkm.img || true
           if [ -d vendor_dlkm_extracted ]; then
             find vendor_dlkm_extracted -name "modules.load*" -exec cp {} ../extracted_assets/configs/ \; || true
