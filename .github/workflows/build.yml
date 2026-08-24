@@ -19,17 +19,9 @@ jobs:
       - name: Install Dependencies & Tools  
         run: |  
           sudo apt-get update && sudo apt-get install -y aria2 p7zip-full cpio
-            
-          # Install payload-dumper-go  
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz  
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz  
           sudo cp payload-dumper-go /usr/local/bin/  
-
-          # Install Magiskboot  
-          wget https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip  
-          unzip -q magisk.zip 'lib/x86_64/libmagiskboot.so'  
-          sudo mv lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot  
-          sudo chmod +x /usr/local/bin/magiskboot  
 
       - name: Fast Download HyperOS 2 ROM  
         run: |  
@@ -40,41 +32,27 @@ jobs:
           unzip -q rom.zip payload.bin  
           rm -f rom.zip  
 
-      - name: Dump Target Partitions (vendor_boot & vendor)  
+      - name: Dump Target Partition (vendor_dlkm)  
         run: |  
-          payload-dumper-go -o dumped_images -p vendor_boot,vendor payload.bin  
+          payload-dumper-go -o dumped_images -p vendor_dlkm payload.bin  
           rm -f payload.bin  
 
-      - name: Extract DTB and Touch Modules on Cloud  
+      - name: Extract Touch Modules from vendor_dlkm  
         run: |  
-          mkdir -p extracted_assets/modules extracted_assets/dtb  
-            
+          mkdir -p extracted_assets/modules
+          
           cd dumped_images  
-          magiskboot unpack vendor_boot.img || true
-            
-          if [ -f dtb ]; then   
-            cp dtb ../extracted_assets/dtb/mt6835.dtb  
-          fi  
-            
-          # Unpack ramdisk and force GitHub to ignore the padding warnings using || true
-          if [ -f ramdisk.cpio ]; then  
-            mkdir ramdisk_extracted && cd ramdisk_extracted  
-            cpio -idm < ../ramdisk.cpio || true
-            find . -name "*.ko" -exec cp {} ../../../extracted_assets/modules/ \;  
-            cd ..  
-          fi  
-            
-          # Extract vendor partition and ignore any 7z warnings
-          7z x vendor.img -ovendor_extracted -y || true  
-          if [ -d vendor_extracted ]; then  
-            find vendor_extracted -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;  
+          # Extract vendor_dlkm partition
+          7z x vendor_dlkm.img -ovendor_dlkm_extracted -y || true  
+          if [ -d vendor_dlkm_extracted ]; then  
+            find vendor_dlkm_extracted -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;  
           fi  
             
           cd ..  
           rm -rf dumped_images  
 
-      - name: Upload Tiny Extracted Assets Artifact  
+      - name: Upload DLKM Modules Artifact  
         uses: actions/upload-artifact@v4  
         with:  
-          name: HyperOS2-V2-Extracted-Assets  
+          name: HyperOS2-A15-Touch-Modules  
           path: extracted_assets/**/*
