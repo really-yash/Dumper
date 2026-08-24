@@ -1,4 +1,4 @@
-name: HyperOS 2 Cloud Extractor
+name: HyperOS 2 Unified Text Extractor
 on:
   workflow_dispatch:
 
@@ -6,44 +6,49 @@ jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
-      - name: Install Dependencies & Tools  
+      - name: Install Dependencies
         run: |  
-          sudo apt-get update && sudo apt-get install -y aria2 p7zip-full cpio erofs-utils
+          sudo apt-get update && sudo apt-get install -y aria2 cpio erofs-utils
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz  
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz  
           sudo cp payload-dumper-go /usr/local/bin/  
+          wget https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
+          unzip -q magisk.zip 'lib/x86_64/libmagiskboot.so'
+          sudo mv lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot
+          sudo chmod +x /usr/local/bin/magiskboot
 
-      - name: Fast Download HyperOS 2 ROM  
+      - name: Fast Download ROM  
         run: |  
           aria2c -x 16 -s 16 -k 1M --file-allocation=none --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o rom.zip "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS2.0.208.0.VGQINXM/air_in_global-ota_full-OS2.0.208.0.VGQINXM-user-15.0-93391672cc.zip"
+          unzip -q rom.zip payload.bin && rm -f rom.zip
 
-      - name: Extract payload.bin  
+      - name: Dump Partitions
         run: |  
-          unzip -q rom.zip payload.bin  
-          rm -f rom.zip  
-
-      - name: Dump Target Partition (vendor_dlkm)  
-        run: |  
-          payload-dumper-go -o dumped_images -p vendor_dlkm payload.bin  
+          payload-dumper-go -o dumped_images -p vendor_boot,vendor_dlkm payload.bin  
           rm -f payload.bin  
 
-      - name: Extract Touch Modules from EROFS vendor_dlkm  
+      - name: Extract Text Configurations
         run: |  
-          mkdir -p extracted_assets/modules
+          mkdir -p extracted_assets
+          cd dumped_images
           
-          cd dumped_images  
-          # Extract using fsck.erofs instead of 7z
-          fsck.erofs --extract=vendor_dlkm_extracted vendor_dlkm.img || true  
-          
-          if [ -d vendor_dlkm_extracted ]; then  
-            find vendor_dlkm_extracted -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;  
-          fi  
-            
-          cd ..  
-          rm -rf dumped_images  
+          # 1. Get the .rc files from vendor_boot ramdisk
+          magiskboot unpack vendor_boot.img || true
+          if [ -f ramdisk.cpio ]; then
+            mkdir ramdisk_extracted && cd ramdisk_extracted
+            cpio -idm < ../ramdisk.cpio || true
+            find . -name "*.rc" -exec cp {} ../../extracted_assets/ \;
+            cd ..
+          fi
 
-      - name: Upload DLKM Modules Artifact  
+          # 2. Get the load order from vendor_dlkm (EROFS)
+          fsck.erofs --extract=vendor_dlkm_extracted vendor_dlkm.img || true
+          if [ -d vendor_dlkm_extracted ]; then
+            find vendor_dlkm_extracted -name "modules.load.recovery" -exec cp {} ../extracted_assets/ \;
+          fi
+
+      - name: Upload Config Artifacts  
         uses: actions/upload-artifact@v4  
         with:  
-          name: HyperOS2-A15-Touch-Modules  
+          name: HyperOS2-Config-Files  
           path: extracted_assets/**/*
