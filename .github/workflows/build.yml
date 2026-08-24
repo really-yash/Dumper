@@ -16,24 +16,28 @@ jobs:
           large-packages: true
           swap-storage: false
 
-      - name: Install payload-dumper-go
+      - name: Install payload-dumper-go & aria2
         run: |
+          sudo apt-get update && sudo apt-get install -y aria2
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz
           sudo cp payload-dumper-go /usr/local/bin/
 
-      - name: Download HyperOS 2 ROM
+      - name: Fast Multi-Threaded Download
         run: |
-          wget -q -O rom.zip "https://bigota.d.miui.com/OS2.0.207.0.VGQINXM/air_in_global-ota_full-OS2.0.207.0.VGQINXM-user-15.0-eba6e3654a.zip"
+          aria2c -x 16 -s 16 -k 1M --file-allocation=none \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+            -o rom.zip "https://bigota.d.miui.com/OS2.0.207.0.VGQINXM/air_in_global-ota_full-OS2.0.207.0.VGQINXM-user-15.0-eba6e3654a.zip"
 
       - name: Extract payload.bin & Clean Up
         run: |
           unzip rom.zip payload.bin
-          rm rom.zip # Deleting the zip immediately to save 5GB of runner storage!
+          rm -f rom.zip
 
       - name: Dump Golden Partitions
         run: |
           payload-dumper-go -o dumped_images -p boot,init_boot,vendor_boot,vendor,odm,dtbo payload.bin
+          rm -f payload.bin
 
       - name: Upload Images as Artifact
         uses: actions/upload-artifact@v4
