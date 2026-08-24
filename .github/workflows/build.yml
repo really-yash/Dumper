@@ -1,4 +1,4 @@
-name: HyperOS 2 Unified Text Extractor
+name: HyperOS 2 Ultimate Unified Extractor
 on:
   workflow_dispatch:
 
@@ -8,7 +8,7 @@ jobs:
     steps:
       - name: Install Dependencies
         run: |  
-          sudo apt-get update && sudo apt-get install -y aria2 cpio erofs-utils
+          sudo apt-get update && sudo apt-get install -y aria2 p7zip-full cpio erofs-utils
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz  
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz  
           sudo cp payload-dumper-go /usr/local/bin/  
@@ -24,31 +24,36 @@ jobs:
 
       - name: Dump Partitions
         run: |  
-          payload-dumper-go -o dumped_images -p vendor_boot,vendor_dlkm payload.bin  
+          payload-dumper-go -o dumped_images -p vendor_boot,vendor_dlkm,dtbo payload.bin  
           rm -f payload.bin  
 
-      - name: Extract Text Configurations
+      - name: Extract Configs & Prebuilts
         run: |  
-          mkdir -p extracted_assets
+          mkdir -p extracted_assets/prebuilt extracted_assets/configs
+          
+          # 1. Save dtbo.img and vendor_boot.img for the prebuilt folder
+          cp dumped_images/dtbo.img extracted_assets/prebuilt/ || true
+          cp dumped_images/vendor_boot.img extracted_assets/prebuilt/ || true
+
           cd dumped_images
           
-          # 1. Get the .rc files from vendor_boot ramdisk
+          # 2. Get the .rc files using magiskboot to avoid cpio crashes
           magiskboot unpack vendor_boot.img || true
           if [ -f ramdisk.cpio ]; then
             mkdir ramdisk_extracted && cd ramdisk_extracted
-            cpio -idm < ../ramdisk.cpio || true
-            find . -name "*.rc" -exec cp {} ../../extracted_assets/ \;
+            magiskboot cpio ../ramdisk.cpio extract || true
+            find . -name "*.rc" -exec cp {} ../../extracted_assets/configs/ \; || true
             cd ..
           fi
 
-          # 2. Get the load order from vendor_dlkm (EROFS)
+          # 3. Get the load order from vendor_dlkm (EROFS)
           fsck.erofs --extract=vendor_dlkm_extracted vendor_dlkm.img || true
           if [ -d vendor_dlkm_extracted ]; then
-            find vendor_dlkm_extracted -name "modules.load.recovery" -exec cp {} ../extracted_assets/ \;
+            find vendor_dlkm_extracted -name "modules.load*" -exec cp {} ../extracted_assets/configs/ \; || true
           fi
 
-      - name: Upload Config Artifacts  
+      - name: Upload Config & Prebuilt Artifacts  
         uses: actions/upload-artifact@v4  
         with:  
-          name: HyperOS2-Config-Files  
+          name: HyperOS2-Unified-Assets  
           path: extracted_assets/**/*
