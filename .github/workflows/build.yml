@@ -18,14 +18,14 @@ jobs:
 
       - name: Install Dependencies & Tools
         run: |
-          sudo apt-get update && sudo apt-get install -y aria2 cpio p7zip-full
+          sudo apt-get update && sudo apt-get install -y aria2 p7zip-full
           
           # Install payload-dumper-go
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz
           sudo cp payload-dumper-go /usr/local/bin/
 
-          # Install Magiskboot for unpacking boot/vendor_boot images
+          # Install Magiskboot
           wget https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
           unzip -q magisk.zip 'lib/x86_64/libmagiskboot.so'
           sudo mv lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot
@@ -51,7 +51,6 @@ jobs:
         run: |
           mkdir -p extracted_assets/modules extracted_assets/dtb
           
-          # Unpack vendor_boot to get kernel, dtb, and ramdisk
           cd dumped_images
           magiskboot unpack vendor_boot.img
           
@@ -59,14 +58,15 @@ jobs:
             cp dtb ../extracted_assets/dtb/mt6835.dtb
           fi
           
+          # Use magiskboot to properly extract and parse the ramdisk
           if [ -f ramdisk.cpio ]; then
             mkdir ramdisk_extracted && cd ramdisk_extracted
-            cpio -i < ../ramdisk.cpio
+            magiskboot cpio ../ramdisk.cpio extract
             find . -name "*.ko" -exec cp {} ../../../extracted_assets/modules/ \;
             cd ..
           fi
           
-          # Extract vendor partition using 7z to grab all system kernel modules (FocalTech, etc.)
+          # Extract vendor partition to grab all system kernel modules
           7z x vendor.img -ovendor_extracted -y || true
           if [ -d vendor_extracted/lib/modules ]; then
             find vendor_extracted/lib/modules -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;
@@ -75,7 +75,6 @@ jobs:
           fi
           
           cd ..
-          # Clean up giant images to save space
           rm -rf dumped_images
 
       - name: Upload Tiny Extracted Assets Artifact
