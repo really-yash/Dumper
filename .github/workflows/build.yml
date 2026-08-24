@@ -6,19 +6,9 @@ jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
-      - name: Free up disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: false
-
       - name: Install Dependencies & Tools  
         run: |  
-          sudo apt-get update && sudo apt-get install -y aria2 p7zip-full cpio
+          sudo apt-get update && sudo apt-get install -y aria2 p7zip-full cpio erofs-utils
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz  
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz  
           sudo cp payload-dumper-go /usr/local/bin/  
@@ -37,13 +27,14 @@ jobs:
           payload-dumper-go -o dumped_images -p vendor_dlkm payload.bin  
           rm -f payload.bin  
 
-      - name: Extract Touch Modules from vendor_dlkm  
+      - name: Extract Touch Modules from EROFS vendor_dlkm  
         run: |  
           mkdir -p extracted_assets/modules
           
           cd dumped_images  
-          # Extract vendor_dlkm partition
-          7z x vendor_dlkm.img -ovendor_dlkm_extracted -y || true  
+          # Extract using fsck.erofs instead of 7z
+          fsck.erofs --extract=vendor_dlkm_extracted vendor_dlkm.img || true  
+          
           if [ -d vendor_dlkm_extracted ]; then  
             find vendor_dlkm_extracted -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;  
           fi  
