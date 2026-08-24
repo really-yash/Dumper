@@ -1,9 +1,9 @@
-name: HyperOS 2 Custom Dumper
+name: HyperOS 2 Cloud Extractor
 on:
   workflow_dispatch:
 
 jobs:
-  dump:
+  extract:
     runs-on: ubuntu-latest
     steps:
       - name: Free up disk space
@@ -16,31 +16,70 @@ jobs:
           large-packages: true
           swap-storage: false
 
-      - name: Install payload-dumper-go & aria2
+      - name: Install Dependencies & Tools
         run: |
-          sudo apt-get update && sudo apt-get install -y aria2
+          sudo apt-get update && sudo apt-get install -y aria2 cpio p7zip-full
+          
+          # Install payload-dumper-go
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz
           sudo cp payload-dumper-go /usr/local/bin/
 
-      - name: Fast Multi-Threaded Download
+          # Install Magiskboot for unpacking boot/vendor_boot images
+          wget https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
+          unzip -q magisk.zip 'lib/x86_64/libmagiskboot.so'
+          sudo mv lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot
+          sudo chmod +x /usr/local/bin/magiskboot
+
+      - name: Fast Download HyperOS 2 ROM
         run: |
           aria2c -x 16 -s 16 -k 1M --file-allocation=none \
             --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
             -o rom.zip "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS2.0.208.0.VGQINXM/air_in_global-ota_full-OS2.0.208.0.VGQINXM-user-15.0-93391672cc.zip"
 
-      - name: Extract payload.bin & Clean Up
+      - name: Extract payload.bin
         run: |
-          unzip rom.zip payload.bin
+          unzip -q rom.zip payload.bin
           rm -f rom.zip
 
-      - name: Dump Golden Partitions
+      - name: Dump Target Partitions (vendor_boot & vendor)
         run: |
-          payload-dumper-go -o dumped_images -p boot,init_boot,vendor_boot,vendor,odm,dtbo payload.bin
+          payload-dumper-go -o dumped_images -p vendor_boot,vendor payload.bin
           rm -f payload.bin
 
-      - name: Upload Images as Artifact
+      - name: Extract DTB and Touch Modules on Cloud
+        run: |
+          mkdir -p extracted_assets/modules extracted_assets/dtb
+          
+          # Unpack vendor_boot to get kernel, dtb, and ramdisk
+          cd dumped_images
+          magiskboot unpack vendor_boot.img
+          
+          if [ -f dtb ]; then 
+            cp dtb ../extracted_assets/dtb/mt6835.dtb
+          fi
+          
+          if [ -f ramdisk.cpio ]; then
+            mkdir ramdisk_extracted && cd ramdisk_extracted
+            cpio -i < ../ramdisk.cpio
+            find . -name "*.ko" -exec cp {} ../../../extracted_assets/modules/ \;
+            cd ..
+          fi
+          
+          # Extract vendor partition using 7z to grab all system kernel modules (FocalTech, etc.)
+          7z x vendor.img -ovendor_extracted -y || true
+          if [ -d vendor_extracted/lib/modules ]; then
+            find vendor_extracted/lib/modules -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;
+          elif [ -d vendor_extracted/vendor/lib/modules ]; then
+            find vendor_extracted/vendor/lib/modules -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;
+          fi
+          
+          cd ..
+          # Clean up giant images to save space
+          rm -rf dumped_images
+
+      - name: Upload Tiny Extracted Assets Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HyperOS2-Golden-Images
-          path: dumped_images/*.img
+          name: HyperOS2-V2-Extracted-Assets
+          path: extracted_assets/**/*
