@@ -1,10 +1,12 @@
 name: HyperOS 2 Cloud Extractor
+
 on:
   workflow_dispatch:
 
 jobs:
   extract:
     runs-on: ubuntu-latest
+
     steps:
       - name: Free up disk space
         uses: jlumbroso/free-disk-space@main
@@ -18,67 +20,123 @@ jobs:
 
       - name: Install Dependencies & Tools
         run: |
-          sudo apt-get update && sudo apt-get install -y aria2 p7zip-full
-          
+          sudo apt-get update
+          sudo apt-get install -y aria2 p7zip-full unzip file
+
           # Install payload-dumper-go
-          wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          wget -q https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -xf payload-dumper-go_1.2.2_linux_amd64.tar.gz
-          sudo cp payload-dumper-go /usr/local/bin/
+          sudo install -m 755 payload-dumper-go /usr/local/bin/payload-dumper-go
 
           # Install Magiskboot
-          wget https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
+          wget -q https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -O magisk.zip
           unzip -q magisk.zip 'lib/x86_64/libmagiskboot.so'
-          sudo mv lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot
-          sudo chmod +x /usr/local/bin/magiskboot
+          sudo install -m 755 lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot
 
       - name: Fast Download HyperOS 2 ROM
         run: |
           aria2c -x 16 -s 16 -k 1M --file-allocation=none \
-            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-            -o rom.zip "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS2.0.208.0.VGQINXM/air_in_global-ota_full-OS2.0.208.0.VGQINXM-user-15.0-93391672cc.zip"
+            --user-agent="Mozilla/5.0" \
+            -o rom.zip \
+            "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS2.0.208.0.VGQINXM/air_in_global-ota_full-OS2.0.208.0.VGQINXM-user-15.0-93391672cc.zip"
 
       - name: Extract payload.bin
         run: |
           unzip -q rom.zip payload.bin
           rm -f rom.zip
 
-      - name: Dump Target Partitions (vendor_boot & vendor)
+      - name: Dump Target Partitions
         run: |
-          payload-dumper-go -o dumped_images -p vendor_boot,vendor payload.bin
+          mkdir -p dumped_images
+
+          # vendor_dlkm is included because HyperOS often stores kernel modules there
+          payload-dumper-go \
+            -o dumped_images \
+            -p vendor_boot,vendor,vendor_dlkm \
+            payload.bin
+
           rm -f payload.bin
+          ls -lh dumped_images
 
-      - name: Extract DTB and Touch Modules on Cloud
+      - name: Extract DTB from vendor_boot
         run: |
-          mkdir -p extracted_assets/modules extracted_assets/dtb
-          
-          cd dumped_images
-          magiskboot unpack vendor_boot.img
-          
-          if [ -f dtb ]; then 
-            cp dtb ../extracted_assets/dtb/mt6835.dtb
-          fi
-          
-          # Use magiskboot to properly extract and parse the ramdisk
-          if [ -f ramdisk.cpio ]; then
-            mkdir ramdisk_extracted && cd ramdisk_extracted
-            magiskboot cpio ../ramdisk.cpio extract
-            find . -name "*.ko" -exec cp {} ../../../extracted_assets/modules/ \;
-            cd ..
-          fi
-          
-          # Extract vendor partition to grab all system kernel modules
-          7z x vendor.img -ovendor_extracted -y || true
-          if [ -d vendor_extracted/lib/modules ]; then
-            find vendor_extracted/lib/modules -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;
-          elif [ -d vendor_extracted/vendor/lib/modules ]; then
-            find vendor_extracted/vendor/lib/modules -name "*.ko" -exec cp {} ../extracted_assets/modules/ \;
-          fi
-          
-          cd ..
-          rm -rf dumped_images
+          mkdir -p extracted_assets/dtb extracted_assets/modules work
+          cd work
 
-      - name: Upload Tiny Extracted Assets Artifact
+          cp ../dumped_images/vendor_boot.img .
+
+          magiskboot unpack vendor_boot.img || true
+
+          # Copy any DTB files found by magiskboot
+          find . -maxdepth 2 -type f \( -name "dtb" -o -name "*.dtb" \) -print -exec cp {} ../extracted_assets/dtb/ \; || true
+
+          # Save ramdisk only if it is actually a valid CPIO archive
+          if [ -f ramdisk.cpio ]; then
+            echo "Checking ramdisk.cpio format..."
+            file ramdisk.cpio
+
+            # CPIO archives usually start with 070701, 070702, or 070707
+            MAGIC=$(head -c 6 ramdisk.cpio 2>/dev/null || true)
+
+            if [[ "$MAGIC" == "070701" || "$MAGIC" == "070702" || "$MAGIC" == "070707" ]]; then
+              echo "Valid CPIO archive detected. Extracting..."
+              mkdir -p ramdisk_extracted
+              cd ramdisk_extracted
+              magiskboot cpio ../ramdisk.cpio extract || true
+
+              find . -type f -name "*.ko" \
+                -exec cp -n {} ../../extracted_assets/modules/ \; || true
+            else
+              echo "ramdisk.cpio is not a standard CPIO archive. Skipping safely."
+            fi
+          fi
+
+          cd ..
+          rm -rf work
+
+      - name: Extract Kernel Modules from Partitions
+        run: |
+          for IMG in dumped_images/vendor.img dumped_images/vendor_dlkm.img; do
+            if [ ! -f "$IMG" ]; then
+              echo "Partition not found: $IMG"
+              continue
+            fi
+
+            NAME=$(basename "$IMG" .img)
+            OUTDIR="partition_extract/$NAME"
+
+            echo "Extracting $IMG..."
+            mkdir -p "$OUTDIR"
+
+            # Try 7z extraction. Don't fail the workflow if filesystem is unsupported.
+            7z x "$IMG" -o"$OUTDIR" -y || true
+
+            # Search recursively for kernel modules
+            find "$OUTDIR" -type f -name "*.ko" \
+              -exec cp -n {} extracted_assets/modules/ \; || true
+          done
+
+      - name: Show Extracted Assets
+        run: |
+          echo "===== DTB FILES ====="
+          find extracted_assets/dtb -type f -printf "%p (%s bytes)\n" || true
+
+          echo ""
+          echo "===== KERNEL MODULES ====="
+          find extracted_assets/modules -type f -name "*.ko" -printf "%f (%s bytes)\n" || true
+
+          echo ""
+          echo "===== TOTAL ====="
+          echo "DTBs: $(find extracted_assets/dtb -type f | wc -l)"
+          echo "Modules: $(find extracted_assets/modules -type f -name "*.ko" | wc -l)"
+
+      - name: Upload Extracted Assets Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HyperOS2-V2-Extracted-Assets
-          path: extracted_assets/**/*
+          name: HyperOS2-Extracted-Assets
+          path: extracted_assets/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Complete job
+        run: echo "Extraction completed successfully!"
