@@ -1,0 +1,219 @@
+name: Extract partition from ROM
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "ROM download link (PixelDrain or any direct link)"
+        required: true
+        default: "https://pixeldrain.com/api/file/gQmXrRGz?download"
+      partition:
+        description: "Partition to extract (system, system_ext, vendor, product, odm, boot...)"
+        required: true
+        default: "system"
+      uploader:
+        description: "Where to upload the result"
+        type: choice
+        default: huggingface
+        options:
+          - huggingface
+          - gofile
+      hf_repo:
+        description: "Hugging Face dataset repo (used when uploader = huggingface)"
+        required: true
+        default: "Yash10101/xiaomi-firmware-cache"
+      compress:
+        description: "Compress with zstd before upload (smaller, faster to download, needs unzstd after)"
+        type: boolean
+        default: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      ROM_URL: ${{ inputs.rom_url }}
+      PARTITION: ${{ inputs.partition }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip jq zstd xxd android-sdk-libsparse-utils
+
+      - name: Download ROM
+        run: |
+          curl -L --fail --retry 10 --retry-delay 5 --retry-all-errors -C - \
+               -A "Mozilla/5.0" -o rom.zip "$ROM_URL"
+          ls -lh rom.zip
+          if ! unzip -tq rom.zip >/dev/null 2>&1; then
+            echo "::error::Downloaded file is not a valid ZIP (link expired, rate limited, or an HTML page)."
+            head -c 300 rom.zip || true
+            exit 1
+          fi
+          echo "Zip contents:"
+          unzip -Z1 rom.zip | grep -v '/$' | head -60
+
+      - name: Write LP (super.img) extractor
+        run: |
+          cat > lp_extract.py <<'PY'
+          import struct, sys
+          LP_GEOMETRY_MAGIC = 0x616C4467
+          LP_HEADER_MAGIC = 0x414C5030
+          src, want, outp = sys.argv[1:4]
+          want = want.lower().removesuffix(".img")
+
+          with open(src, "rb") as f:
+              head = f.read(1 << 20)
+              if struct.unpack_from("<I", head, 4096)[0] != LP_GEOMETRY_MAGIC:
+                  sys.exit("Not a dynamic-partition super image (no LP geometry).")
+              m = 4096 + 8192
+              hmagic, _maj, _min, hsize = struct.unpack_from("<IHHI", head, m)
+              if hmagic != LP_HEADER_MAGIC:
+                  sys.exit("LP metadata header not found.")
+              p_off, p_n, p_sz, e_off, e_n, e_sz = struct.unpack_from("<6I", head, m + 80)
+              tbl = m + hsize
+              parts = {}
+              for i in range(p_n):
+                  b = tbl + p_off + i * p_sz
+                  name = head[b:b + 36].split(b"\x00")[0].decode()
+                  _attrs, first, cnt, _grp = struct.unpack_from("<IIII", head, b + 36)
+                  ext = []
+                  for j in range(first, first + cnt):
+                      eb = tbl + e_off + j * e_sz
+                      sectors, ttype, tdata, _tsrc = struct.unpack_from("<QIQI", head, eb)
+                      ext.append((ttype, sectors, tdata))
+                  parts[name] = ext
+              sizes = {k: sum(e[1] for e in v) * 512 for k, v in parts.items()}
+              print("Partitions in super:", {k: f"{v/1048576:.0f} MB" for k, v in sizes.items() if v})
+              pick = next((k for k in (want, want + "_a", want + "_b")
+                           if k in parts and sizes[k] > 0), None)
+              if not pick:
+                  sys.exit(f"'{want}' not found in super. Available: {[k for k,v in sizes.items() if v]}")
+              print(f"Extracting '{pick}' ({sizes[pick]/1048576:.1f} MB)")
+              with open(outp, "wb") as out:
+                  for ttype, sectors, tdata in parts[pick]:
+                      length = sectors * 512
+                      if ttype != 0:            # zero-fill extent
+                          out.write(b"\x00" * length)
+                          continue
+                      f.seek(tdata * 512)
+                      left = length
+                      while left > 0:
+                          buf = f.read(min(left, 8 << 20))
+                          if not buf:
+                              sys.exit("super image ended early (truncated download?).")
+                          out.write(buf)
+                          left -= len(buf)
+          PY
+
+      - name: Extract partition
+        run: |
+          set -euo pipefail
+          mkdir -p out work tools
+
+          pick() {
+            for n in "${PARTITION}.img" "${PARTITION}_a.img" "${PARTITION}"; do
+              f=$(find out -type f -name "$n" | head -1)
+              if [ -n "$f" ]; then echo "$f"; return 0; fi
+            done
+            return 0
+          }
+
+          # 1) payload.bin (only if it actually contains the partition)
+          if unzip -Z1 rom.zip | grep -qx 'payload.bin'; then
+            echo ">> payload.bin found, trying it first"
+            gh release download -R ssut/payload-dumper-go -p '*linux_amd64.tar.gz' -D tools
+            tar -xzf tools/*linux_amd64.tar.gz -C tools
+            PD=$(find tools -type f -name payload-dumper-go | head -1)
+            chmod +x "$PD"
+            "$PD" -p "$PARTITION" -o out rom.zip || echo ">> payload.bin did not provide '$PARTITION'"
+          fi
+
+          # 2) super.img inside the zip
+          if [ -z "$(pick)" ]; then
+            SUPER=$(unzip -Z1 rom.zip | grep -E '(^|/)super[^/]*\.img$' | head -1 || true)
+            if [ -z "$SUPER" ]; then
+              echo "::error::'$PARTITION' is not in payload.bin and no super.img exists in this ZIP."
+              exit 1
+            fi
+            echo ">> reading logical partition from $SUPER"
+            unzip -j rom.zip "$SUPER" -d work
+            S="work/$(basename "$SUPER")"
+            rm -f rom.zip
+            if [ "$(head -c4 "$S" | xxd -p)" = "3aff26ed" ]; then
+              echo ">> sparse image, converting"
+              simg2img "$S" work/super.raw.img
+              rm -f "$S"
+              S=work/super.raw.img
+            fi
+            python3 lp_extract.py "$S" "$PARTITION" "out/${PARTITION}.img"
+            rm -rf work
+          fi
+
+          rm -f rom.zip
+          FOUND=$(pick)
+          if [ -z "$FOUND" ]; then
+            echo "::error::'$PARTITION' was not produced. Files in out/:"
+            find out -type f
+            exit 1
+          fi
+          [ "$FOUND" = "${PARTITION}.img" ] || mv "$FOUND" "${PARTITION}.img"
+          rm -rf out
+          if [ "${{ inputs.compress }}" = "true" ]; then
+            zstd -T0 -3 --rm "${PARTITION}.img"
+            echo "FILE=${PARTITION}.img.zst" >> "$GITHUB_ENV"
+          else
+            echo "FILE=${PARTITION}.img" >> "$GITHUB_ENV"
+          fi
+          ls -lh "${PARTITION}"*
+          sha256sum "${PARTITION}"* | tee checksum.txt
+
+      - name: Upload to Hugging Face
+        if: ${{ inputs.uploader == 'huggingface' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ inputs.hf_repo }}
+        run: |
+          pip install -q huggingface_hub
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          repo = os.environ["HF_REPO"]
+          f = os.environ["FILE"]
+          path = f"oxygenos/{f}"
+          api.create_repo(repo, repo_type="dataset", exist_ok=True)
+          api.upload_file(path_or_fileobj=f, path_in_repo=path, repo_id=repo, repo_type="dataset",
+                          commit_message=f"Add {f}")
+          api.upload_file(path_or_fileobj="checksum.txt", path_in_repo=f"oxygenos/{f}.sha256",
+                          repo_id=repo, repo_type="dataset")
+          url = f"https://huggingface.co/datasets/{repo}/resolve/main/{path}"
+          print("DOWNLOAD:", url)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### Uploaded\n\n[{f}]({url})\n\n```\n{open('checksum.txt').read()}\n```\n")
+          PY
+
+      - name: Upload to Gofile
+        if: ${{ inputs.uploader == 'gofile' }}
+        run: |
+          RESP=$(curl -s --retry 3 -F "file=@${FILE}" https://upload.gofile.io/uploadfile)
+          echo "$RESP"
+          LINK=$(echo "$RESP" | jq -r '.data.downloadPage')
+          echo "DOWNLOAD: $LINK"
+          {
+            echo "### Uploaded"
+            echo
+            echo "$LINK"
+            echo
+            echo '```'
+            cat checksum.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
